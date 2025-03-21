@@ -1,0 +1,138 @@
+param (
+    [Parameter(Mandatory=$true)]
+    [string]$SourcePath,
+    
+    [Parameter(Mandatory=$true)]
+    [string]$DestinationPath,
+    
+    [string[]]$IncludeExtensions = @(".ppt", ".xls", ".pdf")
+)
+
+# 初始化计数器
+$global:TotalCopied = 0
+$global:TotalSkipped = 0
+$global:TotalProcessed = 0
+
+function Initialize-Environment {
+    # 转换扩展名为小写方便比较
+    $script:IncludeExtensions = $IncludeExtensions | ForEach-Object { $_.ToLower() }
+    
+    # 验证源路径
+    if (-not (Test-Path $SourcePath -PathType Container)) {
+        Write-Error "源路径不存在或不可访问: $SourcePath"
+        exit 1
+    }
+
+    # 标准化路径格式
+    $script:SourcePath = (Convert-Path $SourcePath).TrimEnd('\')
+}
+
+function Get-RelativePath {
+    param (
+        [string]$Path,
+        [string]$BasePath
+    )
+    return $Path.Substring($BasePath.Length).TrimStart('\')
+}
+
+function Test-NeedCopy {
+    param (
+        [string]$SourceFile,
+        [string]$DestinationFile
+    )
+    
+    if (-not (Test-Path $DestinationFile)) {
+        return $true
+    }
+
+    $srcItem = Get-Item $SourceFile
+    $destItem = Get-Item $DestinationFile
+
+    # 比较修改时间和文件大小
+    return ($srcItem.LastWriteTime -gt $destItem.LastWriteTime) -or 
+           ($srcItem.Length -ne $destItem.Length)
+}
+
+function Copy-FileWithProgress {
+    param (
+        [string]$SourceFile,
+        [string]$DestinationFile
+    )
+    
+    try {
+        $destDir = Split-Path $DestinationFile -Parent
+        if (-not (Test-Path $destDir)) {
+            New-Item -ItemType Directory -Path $destDir -Force | Out-Null
+        }
+        
+        if (Test-NeedCopy $SourceFile $DestinationFile) {
+            Copy-Item -Path $SourceFile -Destination $DestinationFile -Force
+            return $true
+        }
+        return $false
+    }
+    catch {
+        Write-Warning "文件复制失败: $SourceFile → $DestinationFile`n错误信息: $_"
+        return $false
+    }
+}
+
+function Process-File {
+    param (
+        [string]$FilePath
+    )
+    
+    $relativePath = Get-RelativePath -Path $FilePath -BasePath $script:SourcePath
+    $destPath = Join-Path $DestinationPath $relativePath
+    
+    if ($IncludeExtensions -contains [System.IO.Path]::GetExtension($FilePath).ToLower()) {
+        $global:TotalProcessed++
+        
+        if (Copy-FileWithProgress $FilePath $destPath) {
+            $global:TotalCopied++
+            Write-Host "已复制: $FilePath" -ForegroundColor Green
+        }
+        else {
+            $global:TotalSkipped++
+            Write-Host "已跳过: $FilePath" -ForegroundColor Gray
+        }
+    }
+}
+
+# 主程序流程
+try {
+    Initialize-Environment
+
+    Write-Host "开始扫描源目录，这可能需要较长时间..."
+    $allFiles = [System.IO.Directory]::EnumerateFiles($SourcePath, "*.*", [System.IO.SearchOption]::AllDirectories)
+    
+    $totalFiles = [Linq.Enumerable]::Count($allFiles)
+    Write-Host "发现总文件数: $totalFiles"
+
+    $batchSize = 1000
+    $currentBatch = New-Object System.Collections.Generic.List[string]
+
+    foreach ($file in $allFiles) {
+        $currentBatch.Add($file)
+        
+        if ($currentBatch.Count -ge $batchSize) {
+            $currentBatch | ForEach-Object { Process-File $_ }
+            $currentBatch.Clear()
+        }
+    }
+    
+    # 处理剩余文件
+    if ($currentBatch.Count -gt 0) {
+        $currentBatch | ForEach-Object { Process-File $_ }
+    }
+}
+catch {
+    Write-Error "发生严重错误: $_"
+    exit 1
+}
+finally {
+    Write-Host "`n操作完成"
+    Write-Host "总处理文件数: $global:TotalProcessed"
+    Write-Host "成功复制文件数: $global:TotalCopied"
+    Write-Host "跳过文件数: $global:TotalSkipped"
+}
