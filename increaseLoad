@@ -1,0 +1,283 @@
+#Requires -Version 5.0
+#Requires -Modules PureViewInformation
+
+<#
+.SYNOPSIS
+企业级文件同步脚本，支持条件过滤和Purview标签验证
+
+.NOTES
+版本 2.1 | 最后更新 2023-08-20
+#>
+
+#region 配置参数
+$global:Config = @{
+    # 源路径和目标路径配置
+    SourceRoot      = "D:\CorporateDocuments"
+    DestRoot        = "\\fileserver\departments\archive"
+    
+    # 文件扩展名白名单
+    ValidExtensions = @(".ppt", ".xls", ".pdf") 
+    
+    # 可选过滤条件（设置为$null禁用）
+    FileAgeDays     = 3    # 仅同步最近N天修改的文件
+    RequiredLabel   = "L2" # 需要匹配的Purview标签
+}
+#endregion
+
+#region 全局计数器
+$global:SyncStats = @{
+    TotalScanned   = 0
+    CopiedFiles    = 0
+    SkippedFiles   = 0
+    LabelMismatch  = 0
+    TimeFiltered   = 0
+}
+#endregion
+
+function Initialize-SyncEnvironment {
+    <#
+    .DESCRIPTION
+    初始化同步环境，验证必要条件和创建目录结构
+    
+    .OUTPUTS
+    [bool] 是否成功初始化
+    #>
+    try {
+        # 验证Purview模块可用性
+        if (-not (Get-Module -Name PureViewInformation)) {
+            throw "未找到PurviewInformation模块，请先安装"
+        }
+
+        # 验证源路径存在性
+        if (-not (Test-Path $global:Config.SourceRoot -PathType Container)) {
+            throw "源路径不可访问: $($global:Config.SourceRoot)"
+        }
+
+        # 创建目标根目录
+        if (-not (Test-Path $global:Config.DestRoot)) {
+            New-Item -Path $global:Config.DestRoot -ItemType Directory -Force | Out-Null
+            Write-Host "已创建目标目录: $($global:Config.DestRoot)"
+        }
+
+        return $true
+    }
+    catch {
+        Write-Error "环境初始化失败: $_"
+        exit 1
+    }
+}
+
+function Get-CandidateFiles {
+    <#
+    .DESCRIPTION
+    获取候选文件列表，应用初步时间过滤
+    
+    .OUTPUTS
+    [string[]] 文件路径数组
+    #>
+    try {
+        # 如果配置了时间过滤
+        if ($global:Config.FileAgeDays -gt 0) {
+            $cutoffDate = (Get-Date).AddDays(-$global:Config.FileAgeDays)
+            Write-Host "应用时间过滤: $($global:Config.FileAgeDays) 天内的修改文件"
+            
+            return [System.IO.Directory]::EnumerateFiles(
+                $global:Config.SourceRoot, 
+                "*.*", 
+                [System.IO.SearchOption]::AllDirectories
+            ) | Where-Object { 
+                [System.IO.File]::GetLastWriteTime($_) -ge $cutoffDate 
+            }
+        }
+        else {
+            Write-Host "时间过滤未启用"
+            return [System.IO.Directory]::EnumerateFiles(
+                $global:Config.SourceRoot, 
+                "*.*", 
+                [System.IO.SearchOption]::AllDirectories
+            )
+        }
+    }
+    catch {
+        Write-Error "文件枚举失败: $_"
+        exit 2
+    }
+}
+
+function Test-FileConditions {
+    <#
+    .DESCRIPTION
+    验证单个文件是否符合所有过滤条件
+    
+    .PARAMETER FilePath
+    待验证的完整文件路径
+    
+    .OUTPUTS
+    [bool] 是否通过所有条件检查
+    #>
+    param([string]$FilePath)
+    
+    # 获取文件元数据
+    try {
+        $fileItem = Get-Item $FilePath -ErrorAction Stop
+        $metadata = @{
+            Extension   = $fileItem.Extension.ToLower()
+            Label       = (Get-FileLabel -Path $FilePath -ErrorAction Stop).Label
+            LastWrite   = $fileItem.LastWriteTime
+        }
+    }
+    catch {
+        Write-Warning "无法获取文件元数据: $FilePath"
+        return $false
+    }
+
+    # 扩展名检查（强制）
+    if ($global:Config.ValidExtensions -notcontains $metadata.Extension) {
+        $global:SyncStats.SkippedFiles++
+        return $false
+    }
+
+    # 可选标签检查
+    if (-not [string]::IsNullOrEmpty($global:Config.RequiredLabel)) {
+        if ($metadata.Label -ne $global:Config.RequiredLabel) {
+            $global:SyncStats.LabelMismatch++
+            return $false
+        }
+    }
+
+    return $true
+}
+
+function Sync-SingleFile {
+    <#
+    .DESCRIPTION
+    执行单个文件的同步操作
+    
+    .PARAMETER SourcePath
+    源文件完整路径
+    
+    .PARAMETER DestPath
+    目标文件完整路径
+    
+    .OUTPUTS
+    [bool] 是否成功执行同步
+    #>
+    param(
+        [string]$SourcePath,
+        [string]$DestPath
+    )
+    
+    try {
+        # 创建目标目录结构
+        $destDir = [System.IO.Path]::GetDirectoryName($DestPath)
+        if (-not [System.IO.Directory]::Exists($destDir)) {
+            [System.IO.Directory]::CreateDirectory($destDir) | Out-Null
+        }
+
+        # 增量同步逻辑
+        if (-not [System.IO.File]::Exists($DestPath)) {
+            [System.IO.File]::Copy($SourcePath, $DestPath, $true)
+            return $true
+        }
+
+        # 比较文件差异
+        $srcFile = [System.IO.FileInfo]$SourcePath
+        $destFile = [System.IO.FileInfo]$DestPath
+        
+        if ($srcFile.LastWriteTime -gt $destFile.LastWriteTime -or 
+            $srcFile.Length -ne $destFile.Length) {
+            [System.IO.File]::Copy($SourcePath, $DestPath, $true)
+            return $true
+        }
+
+        return $false
+    }
+    catch {
+        Write-Warning "文件同步失败: $SourcePath → $DestPath`n错误信息: $_"
+        return $false
+    }
+}
+
+function Invoke-BatchSync {
+    <#
+    .DESCRIPTION
+    批量执行文件同步，优化内存使用
+    
+    .PARAMETER FileList
+    需要处理的文件路径数组
+    #>
+    param([string[]]$FileList)
+    
+    $batchSize = 2000  # 根据内存容量调整
+    $totalFiles = $FileList.Count
+    
+    for ($i=0; $i -lt $totalFiles; $i+=$batchSize) {
+        $batch = $FileList[$i..($i+$batchSize-1)]
+        $batch | ForEach-Object {
+            $global:SyncStats.TotalScanned++
+            
+            # 生成目标路径
+            $relPath = $_.Substring($global:Config.SourceRoot.Length).TrimStart('\')
+            $destPath = [System.IO.Path]::Combine($global:Config.DestRoot, $relPath)
+            
+            # 执行同步
+            if (Sync-SingleFile $_ $destPath) {
+                $global:SyncStats.CopiedFiles++
+                Write-Host "同步成功: $relPath" -ForegroundColor Green
+            }
+            else {
+                $global:SyncStats.SkippedFiles++
+                Write-Host "文件未变化: $relPath" -ForegroundColor Gray
+            }
+        }
+    }
+}
+
+#region 主程序
+try {
+    # 初始化阶段
+    if (-not (Initialize-SyncEnvironment)) { exit 1 }
+    
+    Write-Host "`n启动企业文档同步任务"
+    Write-Host "源目录: $($global:Config.SourceRoot)"
+    Write-Host "目标目录: $($global:Config.DestRoot)"
+    Write-Host "文件类型: $($global:Config.ValidExtensions -join ', ')"
+    Write-Host "激活条件: $(
+        @(
+            if ($global:Config.FileAgeDays) { "最近$($global:Config.FileAgeDays)天修改" }
+            if ($global:Config.RequiredLabel) { "标签[$($global:Config.RequiredLabel)]" }
+        ) -join ' + '
+    )`n"
+
+    # 获取候选文件
+    $candidateFiles = Get-CandidateFiles
+    Write-Host "初步候选文件数: $($candidateFiles.Count)"
+    
+    # 精确过滤阶段
+    $validFiles = $candidateFiles | Where-Object {
+        Test-FileConditions $_
+    }
+    
+    Write-Host "符合条件文件数: $($validFiles.Count)`n"
+    
+    # 执行同步
+    Invoke-BatchSync $validFiles
+}
+catch {
+    Write-Error "同步任务异常终止: $_"
+    exit 3
+}
+finally {
+    # 输出统计报告
+    Write-Host "`n同步任务完成"
+    Write-Host "总扫描文件: $($global:SyncStats.TotalScanned)"
+    Write-Host "成功复制文件: $($global:SyncStats.CopiedFiles)"
+    Write-Host "跳过文件数: $($global:SyncStats.SkippedFiles)"
+    if ($global:Config.FileAgeDays) {
+        Write-Host "时间过滤排除: $($global:SyncStats.TimeFiltered)"
+    }
+    if ($global:Config.RequiredLabel) {
+        Write-Host "标签不匹配: $($global:SyncStats.LabelMismatch)"
+    }
+}
+#endregion
