@@ -1,12 +1,11 @@
 #Requires -Version 5.0
-#Requires -Modules PureViewInformation
 
 <#
 .SYNOPSIS
 企业级文件同步脚本，支持条件过滤和Purview标签验证
 
 .NOTES
-版本 2.1 | 最后更新 2023-08-20
+版本 2.2 | 最后更新 2023-08-20
 #>
 
 #region 配置参数
@@ -20,7 +19,7 @@ $global:Config = @{
     
     # 可选过滤条件（设置为$null禁用）
     FileAgeDays     = 3    # 仅同步最近N天修改的文件
-    RequiredLabel   = "L2" # 需要匹配的Purview标签
+    RequiredLabel   = $null # 需要匹配的Purview标签（设为$null禁用标签检查）
 }
 #endregion
 
@@ -43,9 +42,13 @@ function Initialize-SyncEnvironment {
     [bool] 是否成功初始化
     #>
     try {
-        # 验证Purview模块可用性
-        if (-not (Get-Module -Name PureViewInformation)) {
-            throw "未找到PurviewInformation模块，请先安装"
+        # 如果启用了标签过滤，验证Purview模块
+        if (-not [string]::IsNullOrEmpty($global:Config.RequiredLabel)) {
+            if (-not (Get-Module -Name PureViewInformation -ListAvailable)) {
+                throw "未找到PureviewInformation模块，请先安装"
+            }
+            Import-Module PureViewInformation -Force
+            Write-Host "已加载PureviewInformation模块"
         }
 
         # 验证源路径存在性
@@ -122,8 +125,12 @@ function Test-FileConditions {
         $fileItem = Get-Item $FilePath -ErrorAction Stop
         $metadata = @{
             Extension   = $fileItem.Extension.ToLower()
-            Label       = (Get-FileLabel -Path $FilePath -ErrorAction Stop).Label
             LastWrite   = $fileItem.LastWriteTime
+        }
+
+        # 如果启用了标签过滤，获取文件标签
+        if (-not [string]::IsNullOrEmpty($global:Config.RequiredLabel)) {
+            $metadata['Label'] = (Get-FileLabel -Path $FilePath -ErrorAction Stop).Label
         }
     }
     catch {
