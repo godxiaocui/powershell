@@ -1,12 +1,9 @@
-param (
-    [Parameter(Mandatory=$true)]
-    [string]$SourcePath,
-    
-    [Parameter(Mandatory=$true)]
-    [string]$DestinationPath,
-    
-    [string[]]$IncludeExtensions = @(".ppt", ".xls", ".pdf")
-)
+#Requires -Version 5.0
+
+# 配置区域 - 根据实际环境修改这些值
+$script:SourcePath = "D:\SourceDocuments"       # 源服务器路径
+$script:DestinationPath = "\\192.168.1.100\Backup"  # 目标服务器路径
+$script:IncludeExtensions = @(".ppt", ".xls", ".pdf") # 需要处理的文件类型
 
 # 初始化计数器
 $global:TotalCopied = 0
@@ -14,17 +11,18 @@ $global:TotalSkipped = 0
 $global:TotalProcessed = 0
 
 function Initialize-Environment {
-    # 转换扩展名为小写方便比较
+    # 转换扩展名为小写
     $script:IncludeExtensions = $IncludeExtensions | ForEach-Object { $_.ToLower() }
     
     # 验证源路径
-    if (-not (Test-Path $SourcePath -PathType Container)) {
-        Write-Error "源路径不存在或不可访问: $SourcePath"
+    if (-not (Test-Path $script:SourcePath -PathType Container)) {
+        Write-Error "源路径不存在或不可访问: $($script:SourcePath)"
         exit 1
     }
 
     # 标准化路径格式
-    $script:SourcePath = (Convert-Path $SourcePath).TrimEnd('\')
+    $script:SourcePath = (Convert-Path $script:SourcePath).TrimEnd('\')
+    $script:DestinationPath = $script:DestinationPath.TrimEnd('\')
 }
 
 function Get-RelativePath {
@@ -33,24 +31,6 @@ function Get-RelativePath {
         [string]$BasePath
     )
     return $Path.Substring($BasePath.Length).TrimStart('\')
-}
-
-function Test-NeedCopy {
-    param (
-        [string]$SourceFile,
-        [string]$DestinationFile
-    )
-    
-    if (-not (Test-Path $DestinationFile)) {
-        return $true
-    }
-
-    $srcItem = Get-Item $SourceFile
-    $destItem = Get-Item $DestinationFile
-
-    # 比较修改时间和文件大小
-    return ($srcItem.LastWriteTime -gt $destItem.LastWriteTime) -or 
-           ($srcItem.Length -ne $destItem.Length)
 }
 
 function Copy-FileWithProgress {
@@ -65,11 +45,9 @@ function Copy-FileWithProgress {
             New-Item -ItemType Directory -Path $destDir -Force | Out-Null
         }
         
-        if (Test-NeedCopy $SourceFile $DestinationFile) {
-            Copy-Item -Path $SourceFile -Destination $DestinationFile -Force
-            return $true
-        }
-        return $false
+        # 全量模式直接覆盖
+        Copy-Item -Path $SourceFile -Destination $DestinationFile -Force
+        return $true
     }
     catch {
         Write-Warning "文件复制失败: $SourceFile → $DestinationFile`n错误信息: $_"
@@ -83,9 +61,9 @@ function Process-File {
     )
     
     $relativePath = Get-RelativePath -Path $FilePath -BasePath $script:SourcePath
-    $destPath = Join-Path $DestinationPath $relativePath
+    $destPath = Join-Path $script:DestinationPath $relativePath
     
-    if ($IncludeExtensions -contains [System.IO.Path]::GetExtension($FilePath).ToLower()) {
+    if ($script:IncludeExtensions -contains [System.IO.Path]::GetExtension($FilePath).ToLower()) {
         $global:TotalProcessed++
         
         if (Copy-FileWithProgress $FilePath $destPath) {
@@ -103,13 +81,20 @@ function Process-File {
 try {
     Initialize-Environment
 
-    Write-Host "开始扫描源目录，这可能需要较长时间..."
-    $allFiles = [System.IO.Directory]::EnumerateFiles($SourcePath, "*.*", [System.IO.SearchOption]::AllDirectories)
-    
-    $totalFiles = [Linq.Enumerable]::Count($allFiles)
-    Write-Host "发现总文件数: $totalFiles"
+    Write-Host "开始全量同步操作..."
+    Write-Host "源路径: $($script:SourcePath)"
+    Write-Host "目标路径: $($script:DestinationPath)"
+    Write-Host "处理文件类型: $($script:IncludeExtensions -join ', ')"
 
-    $batchSize = 1000
+    # 使用高效文件枚举
+    $allFiles = [System.IO.Directory]::EnumerateFiles(
+        $script:SourcePath, 
+        "*.*", 
+        [System.IO.SearchOption]::AllDirectories
+    )
+
+    # 分批次处理
+    $batchSize = 2000
     $currentBatch = New-Object System.Collections.Generic.List[string]
 
     foreach ($file in $allFiles) {
@@ -131,8 +116,8 @@ catch {
     exit 1
 }
 finally {
-    Write-Host "`n操作完成"
-    Write-Host "总处理文件数: $global:TotalProcessed"
+    Write-Host "`n同步操作完成"
+    Write-Host "符合条件文件总数: $global:TotalProcessed"
     Write-Host "成功复制文件数: $global:TotalCopied"
-    Write-Host "跳过文件数: $global:TotalSkipped"
+    Write-Host "失败文件数: $global:TotalSkipped"
 }
