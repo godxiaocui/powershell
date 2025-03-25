@@ -1,0 +1,90 @@
+# 在参数区添加CSV路径参数
+param(
+    [string]$ReportPath = "UnsyncedFiles.csv",
+    # 其他原有参数保持不变...
+)
+
+# 新增全局未同步文件集合
+$global:UnsyncedFiles = New-Object System.Collections.ArrayList
+
+function Add-UnsyncedRecord {
+    param(
+        [string]$FilePath,
+        [string]$Reason
+    )
+    
+    $record = [PSCustomObject]@{
+        Date       = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
+        Reason     = $Reason
+        FullPath   = $FilePath
+    }
+    
+    $null = $global:UnsyncedFiles.Add($record)
+}
+
+# 修改后的 Test-FileConditions 函数
+function Test-FileConditions {
+    param([string]$FilePath)
+    
+    try {
+        $fileItem = Get-Item $FilePath -ErrorAction Stop
+
+        # 扩展名检查
+        $extension = $fileItem.Extension.ToLower()
+        if ($global:Config.ValidExtensions -notcontains $extension) {
+            Add-UnsyncedRecord $FilePath "扩展名不匹配 [$extension]"
+            return $false
+        }
+
+        return $true
+    }
+    catch {
+        Add-UnsyncedRecord $FilePath "文件访问失败: $($_.Exception.Message)"
+        return $false
+    }
+}
+
+# 修改后的 Sync-File 函数
+function Sync-File {
+    param(
+        [string]$SourceFile,
+        [string]$DestFile
+    )
+    
+    try {
+        # 文件存在性检查
+        if (-not (Test-Path $DestFile)) {
+            Copy-Item $SourceFile $DestFile
+            return $true
+        }
+
+        # 修改时间比较
+        $srcLastWrite = (Get-Item $SourceFile).LastWriteTime
+        $destLastWrite = (Get-Item $DestFile).LastWriteTime
+        
+        if ($srcLastWrite -gt $destLastWrite) {
+            Copy-Item $SourceFile $DestFile -Force
+            return $true
+        }
+        else {
+            Add-UnsyncedRecord $SourceFile "目标文件已更新"
+            return $false
+        }
+    }
+    catch {
+        Add-UnsyncedRecord $SourceFile "复制失败: $($_.Exception.Message)"
+        return $false
+    }
+}
+
+# 在脚本最后添加报告生成
+try {
+    # 原有主逻辑代码...
+}
+finally {
+    # 生成最终报告
+    if ($global:UnsyncedFiles.Count -gt 0) {
+        $global:UnsyncedFiles | Export-Csv $ReportPath -NoTypeInformation
+        Write-Host "未同步文件报告已保存到: $ReportPath"
+    }
+}
