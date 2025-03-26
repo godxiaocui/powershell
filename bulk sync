@@ -1,0 +1,136 @@
+#Requires -Version 5.0
+
+<#
+.SYNOPSIS
+企业级文件同步脚本（批量标签优化版）
+
+.NOTES
+版本 2.3 | 最后更新 2023-08-21
+#>
+
+#region 配置参数
+$global:Config = @{
+    SourceRoot      = "D:\CorporateDocuments"
+    DestRoot        = "\\fileserver\departments\archive"    
+    ValidExtensions = @(".ppt", ".xls", ".pdf") 
+    FileAgeDays     = 3    
+    RequiredLabel   = "L2"
+    # 新增批量参数
+    LabelBatchSize  = 500  # 标签查询批次大小
+}
+#endregion
+
+#region 全局数据
+$global:SyncStats = @{
+    TotalScanned   = 0
+    CopiedFiles    = 0
+    SkippedFiles   = 0
+    LabelMismatch  = 0
+    TimeFiltered   = 0
+}
+
+# 新增标签缓存
+$global:LabelCache = @{} 
+#endregion
+
+#region 原有函数保持不变
+function Initialize-SyncEnvironment { ... }
+function Get-CandidateFiles { ... }
+function Sync-SingleFile { ... }
+function Invoke-BatchSync { ... }
+#endregion
+
+#region 改进的标签处理函数
+function Get-BulkFileLabels {
+    <#
+    .DESCRIPTION
+    批量获取文件标签信息
+    #>
+    param([string[]]$FilePaths)
+    
+    $totalFiles = $FilePaths.Count
+    Write-Host "正在批量获取文件标签，共 $totalFiles 个文件..."
+    
+    for ($i=0; $i -lt $totalFiles; $i+=$global:Config.LabelBatchSize) {
+        $batch = $FilePaths[$i..($i+$global:Config.LabelBatchSize-1)]
+        
+        try {
+            # 批量获取标签（假设Get-FileLabel支持数组输入）
+            $labels = Get-FileLabel -Path $batch -ErrorAction Stop
+            
+            # 更新缓存
+            foreach ($item in $labels) {
+                $global:LabelCache[$item.Path] = $item.Label
+            }
+        }
+        catch {
+            Write-Warning "批量标签获取失败: $_ 尝试单文件模式..."
+            $batch | ForEach-Object {
+                try {
+                    $label = Get-FileLabel -Path $_ -ErrorAction Stop
+                    $global:LabelCache[$_] = $label.Label
+                }
+                catch {
+                    $global:LabelCache[$_] = $null
+                }
+            }
+        }
+    }
+}
+
+function Test-FileConditions {
+    param([string]$FilePath)
+    
+    # 保持原有扩展名检查
+    $fileItem = Get-Item $FilePath -ErrorAction Stop
+    if ($global:Config.ValidExtensions -notcontains $fileItem.Extension.ToLower()) {
+        $global:SyncStats.SkippedFiles++
+        return $false
+    }
+
+    # 改进的标签检查
+    if (-not [string]::IsNullOrEmpty($global:Config.RequiredLabel)) {
+        if (-not $global:LabelCache.ContainsKey($FilePath)) {
+            Write-Warning "标签缓存缺失: $FilePath"
+            return $false
+        }
+        
+        if ($global:LabelCache[$FilePath] -ne $global:Config.RequiredLabel) {
+            $global:SyncStats.LabelMismatch++
+            return $false
+        }
+    }
+
+    return $true
+}
+#endregion
+
+#region 主程序改进
+try {
+    Initialize-SyncEnvironment | Out-Null
+    
+    # 获取候选文件（原有逻辑）
+    $candidateFiles = Get-CandidateFiles
+    Write-Host "初步候选文件数: $($candidateFiles.Count)"
+    
+    # 新增批量标签预加载
+    if (-not [string]::IsNullOrEmpty($global:Config.RequiredLabel)) {
+        Get-BulkFileLabels -FilePaths $candidateFiles
+    }
+    
+    # 保持原有过滤逻辑
+    $validFiles = $candidateFiles | Where-Object {
+        Test-FileConditions $_
+    }
+    
+    Write-Host "符合条件文件数: $($validFiles.Count)`n"
+    Invoke-BatchSync $validFiles
+}
+catch {
+    Write-Error "同步任务异常终止: $_"
+    exit 3
+}
+finally {
+    # 原有统计报告保持不变...
+}
+#endregion
