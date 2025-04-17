@@ -1,5 +1,27 @@
 $ppt = New-Object -ComObject PowerPoint.Application
-$pres = $ppt.Presentations.Open("C:\path\to\file.pptx")
-$tags = $pres.Tags | ForEach-Object { $_.Name + "=" + $_.Value }
-$pres.Close()
-$ppt.Quit()
+$ppt.Visible = [Microsoft.Office.Core.MsoTriState]::msoFalse  # 隐藏窗口
+
+try {
+    $pres = $ppt.Presentations.Open("C:\path\to\file.pptx", $true)  # 只读模式
+    $allTags = @{}
+
+    for ($i = 1; $i -le $pres.Tags.Count; $i++) {
+        $tagName = $pres.Tags.Name($i)
+        $tagValue = $pres.Tags.Value($i)
+        $allTags[$tagName] = $tagValue
+    }
+
+    # 输出标签
+    $allTags.GetEnumerator() | Format-Table -AutoSize
+
+    $pres.Close()
+}
+catch {
+    Write-Error "处理 PowerPoint 文件时出错: $_"
+}
+finally {
+    $ppt.Quit()
+    [System.Runtime.Interopservices.Marshal]::ReleaseComObject($pres) | Out-Null
+    [System.Runtime.Interopservices.Marshal]::ReleaseComObject($ppt) | Out-Null
+    [System.GC]::Collect()
+}
