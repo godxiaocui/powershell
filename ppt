@@ -1,0 +1,5 @@
+$ppt = New-Object -ComObject PowerPoint.Application
+$pres = $ppt.Presentations.Open("C:\path\to\file.pptx")
+$tags = $pres.Tags | ForEach-Object { $_.Name + "=" + $_.Value }
+$pres.Close()
+$ppt.Quit()
